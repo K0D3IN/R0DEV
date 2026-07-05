@@ -3,7 +3,7 @@ CFLAGS = -Wall -O2 -fPIC -fmacro-prefix-map=$(PWD)=.
 LDFLAGS = -ldl
 STRIP = strip
 
-.PHONY: all clean strip
+.PHONY: all clean strip release
 
 all: rootkit.so fix_rootkit forcekill injector
 
@@ -19,8 +19,10 @@ forcekill: forcekill.c
 injector: injector.c
 	$(CC) $(CFLAGS) -o $@ $< -ldl
 
-strip:
-	$(STRIP) -s rootkit.so fix_rootkit forcekill injector 2>/dev/null; true
+strip: all
+	$(STRIP) -s rootkit.so fix_rootkit forcekill injector
+
+release: clean all strip
 
 clean:
 	rm -f rootkit.so fix_rootkit forcekill injector *.o
