@@ -1,0 +1,12 @@
+*.o
+*.so
+*.ko
+*.mod
+*.mod.c
+*.symvers
+*.order
+rootkit.so
+fix_rootkit
+forcekill
+injector
+target/

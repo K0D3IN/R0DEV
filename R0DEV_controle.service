@@ -1,0 +1,12 @@
+[Unit]
+Description=R0DEV System Controller
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/R0DEV/loader.sh
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
